@@ -11,7 +11,7 @@ import torchio as tio
 
 from monai.data import CacheDataset, DataLoader, partition_dataset
 from monai.inferers import sliding_window_inference
-from monai.losses import DiceLoss, GeneralizedDiceLoss, TverskyLoss
+from monai.losses import DiceLoss, GeneralizedDiceLoss, TverskyLoss, FocalLoss
 from monai.networks.layers import Norm
 from monai.metrics import compute_meandice
 from monai.networks.nets import UNet, DynUNet
@@ -21,7 +21,7 @@ from monai.transforms import (
 from monai.utils import set_determinism
 from network.deeplabv3_3d import DeepLabV3_3D
 from Ki_UNet_remake import kiunet3dwcrfb_o
-from network.UNet_3Plus_3D import UNet_3Plus_3D
+from network.UNet_3Plus_3D_drop import UNet_3Plus_3D, UNet_3Plus_DeepSup_3D
 
 os.environ["MONAI_DATA_DIRECTORY"] = "./data"
 os.environ["CUDA_VISIBLE_DEVICES"] = '0, 1, 2, 3'
@@ -32,22 +32,23 @@ print(root_dir)
 ### hyperparameter setting
 set_determinism(seed=0)
 
-bs = 32
-Height = 80
+bs = 4
+Height = 96
 Width = Height
 Depth = 16
-epoch_num = 500
-l_rate = 1e-4
+epoch_num = 400
+l_rate = 5e-5
 network = "unet3plus"
 precision = 32
-gpu_num = 4
-dropout = 0.3
+gpu_num = 1
+dropout = 0.1
 model_channels = 32
-
+loss_function = "gdl"
 
 ## define pl module
 class RectalCaSegNet(pl.LightningModule):
-    def __init__(self,bs,Height,Depth,epoch_num,l_rate=1e-3,network='resunet',dropout=None,channels=model_channels,**kwargs):
+    def __init__(self,bs,Height,Depth,epoch_num,l_rate=1e-3,network='resunet',dropout=None,
+    channels=model_channels,loss = "gdl", **kwargs):
         super().__init__()
         if network=="deeplab":
             self._model = DeepLabV3_3D(num_classes=2, input_channels=1, resnet='resnet34_os8')
@@ -71,16 +72,24 @@ class RectalCaSegNet(pl.LightningModule):
         elif network=="kiunet":
             self._model = kiunet3dwcrfb_o(c=1, n=1, num_classes=2)
         elif network=="unet3plus":
-            self._model = UNet_3Plus_3D(in_channels=1, n_classes=2, feature_scale=4, is_deconv=True, is_batchnorm=True, channels=model_channels)
+            self._model = UNet_3Plus_3D(in_channels=1, n_classes=2, feature_scale=4, 
+            is_deconv=True, is_batchnorm=True, channels=model_channels, drop = dropout)
 
-        self.loss_function = GeneralizedDiceLoss(to_onehot_y=True, softmax=True, sigmoid=False, include_background=False)
-        #self.loss_function = FocalLoss()
+        if loss=="gdl":
+            self.loss_function = GeneralizedDiceLoss(
+                to_onehot_y=True, softmax=True, sigmoid=False, include_background=False
+                )
+        elif loss=="focal":
+            self.loss_function = FocalLoss(gamma=2.0)
+        elif loss == "tversky":
+            self.loss_function = TverskyLoss()
         self.post_pred = AsDiscrete(argmax=True, to_onehot=True, n_classes=2)
         self.post_label = AsDiscrete(to_onehot=True, n_classes=2)
         self.best_val_metric = 0
         self.best_val_epoch = 0
         self.Width = Height
         self.save_hyperparameters('bs','Height','Depth','epoch_num','l_rate','network','dropout','channels')
+        self.test_number = 1
 
     def foward(self, x):
         return self._model(x)
@@ -133,35 +142,43 @@ class RectalCaSegNet(pl.LightningModule):
         outputs = self.post_pred(test_output)
         label = self.post_label(labels)
         metric = compute_meandice(outputs, label, include_background=False)
-        # plot the slice [:, :, rand]
-        j = randint(0, len(test_image[0,0,0,0,:])-1)
-        plt.figure("check", (20, 4))
+        # segmentation results
+        for j in range(len(test_image[0,0,0,0,:])):
+            # j = randint(0, len(test_image[0,0,0,0,:])-1)
+            plt.figure("check", (20, 4))
 
-        plt.subplot(1, 5, 1)
-        plt.title(f"original image {batch_idx}")
-        plt.imshow(test_image.detach().cpu()[0, 0, :, :, j], cmap="gray")
+            plt.subplot(1, 5, 1)
+            plt.title(f"original image {batch_idx}")
+            plt.imshow(test_image.detach().cpu()[0, 0, :, :, j], cmap="gray")
 
-        plt.subplot(1, 5, 2)
-        plt.title(f"Ground truth mask")
-        plt.imshow(labels.detach().cpu()[0, 0, :, :, j])
+            plt.subplot(1, 5, 2)
+            plt.title(f"Ground truth mask")
+            plt.imshow(labels.detach().cpu()[0, 0, :, :, j])
 
-        plt.subplot(1, 5, 3)
-        plt.title(f"AI predicted mask")
-        argmax = AsDiscrete(argmax=True)(test_output)
-        plt.imshow(argmax.detach().cpu()[0, 0, :, :, j])
+            plt.subplot(1, 5, 3)
+            plt.title(f"AI predicted mask")
+            argmax = AsDiscrete(argmax=True)(test_output)
+            plt.imshow(argmax.detach().cpu()[0, 0, :, :, j])
 
-        plt.subplot(1, 5, 4)
-        plt.title(f"overaying GT")
-        map_image1 = test_image.clone().detach()
-        map_image1[labels==1] = map_image1.max()
-        plt.imshow(map_image1.detach().cpu()[0, 0, :, :, j], cmap="gray")
+            plt.subplot(1, 5, 4)
+            plt.title(f"overaying GT")
+            map_image1 = test_image.clone().detach()
+            map_image1[labels==1] = map_image1.max()
+            plt.imshow(map_image1.detach().cpu()[0, 0, :, :, j], cmap="gray")
 
-        plt.subplot(1, 5, 5)
-        plt.title(f"overaying predicted")
-        map_image2 = test_image.clone().detach()
-        map_image2[argmax==1] = map_image2.max()
-        plt.imshow(map_image2.detach().cpu()[0, 0, :, :, j], cmap="gray")
-        plt.show()
+            plt.subplot(1, 5, 5)
+            plt.title(f"overaying predicted")
+            map_image2 = test_image.clone().detach()
+            map_image2[argmax==1] = map_image2.max()
+            plt.imshow(map_image2.detach().cpu()[0, 0, :, :, j], cmap="gray")
+            #plt.show()
+
+            # save to image
+            fn = "./results/test_" + "patient" + str(self.test_number) + "_slice" + str(j) + ".png"
+            plt.savefig(fn)
+
+        self.test_number = self.test_number + 1
+
         self.log("test_loss", loss, on_step=False, on_epoch=False, sync_dist=True)
         return {"test_loss": loss, "test_metric": metric}
     def test_epoch_end(self, outputs):
@@ -183,12 +200,12 @@ class RectalCaDataModule(pl.LightningDataModule):
         self.batch_size= batch_size        
 
     def setup(self, stage=None):
-        data_dir = os.path.join(self.data_path, "strata/0/")
-        train_images = sorted(glob.glob(os.path.join(data_dir, "image", "*.nii.gz")))
-        train_labels = sorted(glob.glob(os.path.join(data_dir, "mask", "*.nii.gz")))
-        data_dicts = [
+        data_dir = os.path.join(self.data_path, "test/")
+        test_images = sorted(glob.glob(os.path.join(data_dir, "image", "*.nii.gz")))
+        test_labels = sorted(glob.glob(os.path.join(data_dir, "mask", "*.nii.gz")))
+        self.test_data = [
             {"image": image_name, "label": label_name}
-            for image_name, label_name in zip(train_images, train_labels)
+            for image_name, label_name in zip(test_images, test_labels)
         ]
 
         # HistogramStandardization parameter calculation
@@ -196,53 +213,57 @@ class RectalCaDataModule(pl.LightningDataModule):
         if os.path.isfile(histogram_landmarks_path):
             print("use landmarks.npy")
         else:
-            landmarks = tio.HistogramStandardization.train(train_images,                     
+            landmarks = tio.HistogramStandardization.train(test_images,                     
              output_path=histogram_landmarks_path)
             np.set_printoptions(suppress=True, precision=3)
-                
-        self.train_data, self.val_data = partition_dataset(
-            data_dicts, ratios = [0.8, 0.2], shuffle = True)
-        print('\n'+'Training set:', len(self.train_data), 'subjects')
-        print('Validation set:', len(self.val_data), 'subjects')
+
+        # train_data0, val_data0 = partition_dataset(
+        #     data_dicts0, ratios = [0.8, 0.2], shuffle = True)  
+        # train_data1, val_data1 = partition_dataset(
+        #     data_dicts1, ratios = [0.8, 0.2], shuffle = True) 
+        # self.train_data = train_data0 + train_data1
+        # self.val_data = val_data0 + val_data1
+        # print('\n'+'Training set:', len(self.train_data), 'subjects')
+        # print('Validation set:', len(self.val_data), 'subjects')
         #print('Test set:', len(self.test_data), 'subjects')
  
-    def train_dataloader(self, *args, **kwargs):
-        train_transforms_monai = [
-            LoadNiftid(keys=["image", "label"]),
-            AddChanneld(keys=["image", "label"]),
-            Spacingd(keys=["image", "label"], pixdim=(1.0,1.0,1.0), mode=("bilinear","nearest")),
-            ToTensord(keys=["image", "label"]),
-        ]
-        train_transforms_io = [
-            tio.CropOrPad((Height, Width, Depth),mask_name='label', include=["image", "label"]),
-            tio.HistogramStandardization({'image': 'landmarks.npy'}, include=["image"]),
-            tio.ZNormalization(masking_method=tio.ZNormalization.mean, include=["image"]),
-            tio.RandomNoise(p=0.1, include=["image"]),
-            tio.RandomFlip(axes=(0,), include=["image", "label"]),
-        ]
-        train_transforms = Compose(train_transforms_monai + train_transforms_io)
+    # def train_dataloader(self, *args, **kwargs):
+    #     train_transforms_monai = [
+    #         LoadNiftid(keys=["image", "label"]),
+    #         AddChanneld(keys=["image", "label"]),
+    #         Spacingd(keys=["image", "label"], pixdim=(1.0,1.0,1.0), mode=("bilinear","nearest")),
+    #         ToTensord(keys=["image", "label"]),
+    #     ]
+    #     train_transforms_io = [
+    #         tio.CropOrPad((Height, Width, Depth),mask_name='label', include=["image", "label"]),
+    #         tio.HistogramStandardization({'image': 'landmarks.npy'}, include=["image"]),
+    #         tio.ZNormalization(masking_method=tio.ZNormalization.mean, include=["image"]),
+    #         tio.RandomNoise(p=0.1, include=["image"]),
+    #         tio.RandomFlip(axes=(0,), include=["image", "label"]),
+    #     ]
+    #     train_transforms = Compose(train_transforms_monai + train_transforms_io)
 
-        train_ds = CacheDataset(data=self.train_data, transform=train_transforms, cache_rate=1.0, num_workers=8)
-        train_loader = DataLoader(train_ds, batch_size=self.batch_size, shuffle=True, num_workers=8)
-        return train_loader
+    #     train_ds = CacheDataset(data=self.train_data, transform=train_transforms, cache_rate=1.0, num_workers=8)
+    #     train_loader = DataLoader(train_ds, batch_size=self.batch_size, shuffle=True, num_workers=8)
+    #     return train_loader
 
-    def val_dataloader(self, *args, **kwargs):
-        validation_transforms_monai = [
-        LoadNiftid(keys=["image", "label"]),
-        AddChanneld(keys=["image", "label"]),
-        Spacingd(keys=["image", "label"], pixdim=(1.0,1.0,1.0), mode=("bilinear","nearest")),
-        ToTensord(keys=["image", "label"]),
-        ]
+    # def val_dataloader(self, *args, **kwargs):
+    #     validation_transforms_monai = [
+    #     LoadNiftid(keys=["image", "label"]),
+    #     AddChanneld(keys=["image", "label"]),
+    #     Spacingd(keys=["image", "label"], pixdim=(1.0,1.0,1.0), mode=("bilinear","nearest")),
+    #     ToTensord(keys=["image", "label"]),
+    #     ]
 
-        validation_transforms_io = [
-            tio.CropOrPad((Height, Width, Depth), include=["image", "label"], mask_name='label'),
-            tio.HistogramStandardization({'image': 'landmarks.npy'}, include=["image"]),
-            tio.ZNormalization(masking_method=tio.ZNormalization.mean, include=["image"]),
-        ]
-        val_transforms = Compose(validation_transforms_monai + validation_transforms_io)
-        val_ds = CacheDataset(data=self.val_data, transform=val_transforms, cache_rate=1.0, num_workers=8)
-        val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, num_workers=8)
-        return val_loader
+    #     validation_transforms_io = [
+    #         tio.CropOrPad((Height, Width, Depth), include=["image", "label"], mask_name='label'),
+    #         tio.HistogramStandardization({'image': 'landmarks.npy'}, include=["image"]),
+    #         tio.ZNormalization(masking_method=tio.ZNormalization.mean, include=["image"]),
+    #     ]
+    #     val_transforms = Compose(validation_transforms_monai + validation_transforms_io)
+    #     val_ds = CacheDataset(data=self.val_data, transform=val_transforms, cache_rate=1.0, num_workers=8)
+    #     val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, num_workers=8)
+    #     return val_loader
 
     def test_dataloader(self, *args, **kwargs):
         test_transforms_monai = [
@@ -253,12 +274,11 @@ class RectalCaDataModule(pl.LightningDataModule):
         ]
         test_transforms_io = [
         tio.CropOrPad((Height, Width, Depth), include=["image", "label"], mask_name='label'),
-        tio.HistogramStandardization({'image': 'landmarks.npy'}, include=["image"]),
+        #tio.HistogramStandardization({'image': 'landmarks.npy'}, include=["image"]),
         tio.ZNormalization(masking_method=tio.ZNormalization.mean, include=["image"]),
         ]
         test_transforms = Compose(test_transforms_monai + test_transforms_io)
-        #test_ds = CacheDataset(data=self.test_data,transform=test_transforms, cache_rate=1.0, num_workers=4)
-        test_ds = CacheDataset(data=self.val_data,transform=test_transforms, cache_rate=1.0, num_workers=8)
+        test_ds = CacheDataset(data=self.test_data,transform=test_transforms, cache_rate=1.0, num_workers=4)
         test_loader = DataLoader(test_ds, batch_size=1, num_workers=8)
         return test_loader
 
@@ -267,8 +287,8 @@ class RectalCaDataModule(pl.LightningDataModule):
 dm = RectalCaDataModule(data_path=root_dir, batch_size=bs)
 
 # generate pl training model
-path = './checkpoints/unet3plus-epoch=106-mean_val_loss=0.27-mean_val_metric=0.73-Ver.116.ckpt'
-h_path = './checkpoints/logs/default/version_116/hparams.yaml'
+path = './checkpoints/unet3plus-epoch=208-mean_val_loss=0.25-mean_val_metric=0.74-Ver.129.ckpt'
+h_path = './checkpoints/logs/default/version_129/hparams.yaml'
 net = RectalCaSegNet.load_from_checkpoint(
     checkpoint_path=path,
     hparams_file=h_path,
