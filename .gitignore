@@ -1,0 +1,26 @@
+# : comments
+
+
+# python cache
+# __pycache__/
+
+# vscode
+.vscode/
+*.code-workspace
+
+# ML data
+checkpoints/
+data/
+lightning_logs/
+results/
+
+# test
+test/
+test_run/
+test_main.py
+test.ipynb
+
+# python package info
+pkg/
+requirements*.*
+pkg*.*
